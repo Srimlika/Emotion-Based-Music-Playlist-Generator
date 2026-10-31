@@ -1,42 +1,34 @@
-import numpy as np
+from functools import lru_cache
+from pathlib import Path
+from threading import Lock
+
 import cv2
-from PIL import Image
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout, Flatten
-from tensorflow.keras.layers import Conv2D
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.layers import MaxPooling2D
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from pandastable import Table, TableModel
-from tensorflow.keras.preprocessing import image
-import datetime
-from threading import Thread
-# from Spotipy import *  
-import time
+import numpy as np
 import pandas as pd
-face_cascade=cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
-ds_factor=0.6
+from tensorflow.keras.layers import (
+    Input,
+    Conv2D,
+    Dense,
+    Dropout,
+    Flatten,
+    MaxPooling2D,
+)
+from tensorflow.keras.models import Sequential
 
-emotion_model = Sequential()
-emotion_model.add(Conv2D(32, kernel_size=(3, 3), activation='relu', input_shape=(48,48,1)))
-emotion_model.add(Conv2D(64, kernel_size=(3, 3), activation='relu'))
-emotion_model.add(MaxPooling2D(pool_size=(2, 2)))
-emotion_model.add(Dropout(0.25))
-emotion_model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
-emotion_model.add(MaxPooling2D(pool_size=(2, 2)))
-emotion_model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
-emotion_model.add(MaxPooling2D(pool_size=(2, 2)))
-emotion_model.add(Dropout(0.25))
-emotion_model.add(Flatten())
-emotion_model.add(Dense(1024, activation='relu'))
-emotion_model.add(Dropout(0.5))
-emotion_model.add(Dense(7, activation='softmax'))
-emotion_model.load_weights('model.h5')
 
-cv2.ocl.setUseOpenCL(False)
+BASE_DIR = Path(__file__).resolve().parent
 
-emotion_dict = {0:"Angry",1:"Disgusted",2:"Fearful",3:"Happy",4:"Neutral",5:"Sad",6:"Surprised"}
-music_dist = {
+EMOTIONS = {
+    0: "Angry",
+    1: "Disgusted",
+    2: "Fearful",
+    3: "Happy",
+    4: "Neutral",
+    5: "Sad",
+    6: "Surprised",
+}
+
+SONG_FILES = {
     0: "angry.csv",
     1: "disgusted.csv",
     2: "fearful.csv",
@@ -45,107 +37,204 @@ music_dist = {
     5: "sad.csv",
     6: "surprised.csv",
 }
-global last_frame1                                    
-last_frame1 = np.zeros((480, 640, 3), dtype=np.uint8)
-global cap1 
-show_text=[0]
+
+SONG_COLUMNS = ["Name", "Album", "Artist"]
+
+# The current Flask app shares recommendations across its local session.
+current_emotion = 4
+prediction_lock = Lock()
 
 
-''' Class for calculating FPS while streaming. Used this to check performance of using another thread for video streaming '''
-class FPS:
-	def __init__(self):
-		# store the start time, end time, and total number of frames
-		# that were examined between the start and end intervals
-		self._start = None
-		self._end = None
-		self._numFrames = 0
-	def start(self):
-		# start the timer
-		self._start = datetime.datetime.now()
-		return self
-	def stop(self):
-		# stop the timer
-		self._end = datetime.datetime.now()
-	def update(self):
-		# increment the total number of frames examined during the
-		# start and end intervals
-		self._numFrames += 1
-	def elapsed(self):
-		# return the total number of seconds between the start and
-		# end interval
-		return (self._end - self._start).total_seconds()
-	def fps(self):
-		# compute the (approximate) frames per second
-		return self._numFrames / self.elapsed()
+def build_model():
+    """Recreate the architecture used in train.py."""
+    model = Sequential(
+        [
+            Input(shape=(48, 48, 1)),
+            Conv2D(32, kernel_size=(3, 3), activation="relu"),
+            Conv2D(64, kernel_size=(3, 3), activation="relu"),
+            MaxPooling2D(pool_size=(2, 2)),
+            Dropout(0.25),
+            Conv2D(128, kernel_size=(3, 3), activation="relu"),
+            MaxPooling2D(pool_size=(2, 2)),
+            Conv2D(128, kernel_size=(3, 3), activation="relu"),
+            MaxPooling2D(pool_size=(2, 2)),
+            Dropout(0.25),
+            Flatten(),
+            Dense(1024, activation="relu"),
+            Dropout(0.5),
+            Dense(7, activation="softmax"),
+        ]
+    )
+
+    weights_path = BASE_DIR / "model.h5"
+
+    if not weights_path.is_file():
+        raise FileNotFoundError(
+            f"Model weights not found: {weights_path}"
+        )
+
+    model.load_weights(str(weights_path))
+    return model
 
 
-''' Class for using another thread for video streaming to boost performance '''
-class WebcamVideoStream:
-    	
-		def __init__(self, src=0):
-			self.stream = cv2.VideoCapture(src,cv2.CAP_DSHOW)
-			(self.grabbed, self.frame) = self.stream.read()
-			self.stopped = False
+emotion_model = build_model()
 
-		def start(self):
-				# start the thread to read frames from the video stream
-			Thread(target=self.update, args=()).start()
-			return self
-			
-		def update(self):
-			# keep looping infinitely until the thread is stopped
-			while True:
-				# if the thread indicator variable is set, stop the thread
-				if self.stopped:
-					return
-				# otherwise, read the next frame from the stream
-				(self.grabbed, self.frame) = self.stream.read()
 
-		def read(self):
-			# return the frame most recently read
-			return self.frame
-		def stop(self):
-			# indicate that the thread should be stopped
-			self.stopped = True
+@lru_cache(maxsize=7)
+def load_songs(emotion_index):
+    """Read and validate each song list once."""
+    path = BASE_DIR / SONG_FILES[emotion_index]
 
-''' Class for reading video stream, generating prediction and recommendations '''
-class VideoCamera(object):
-	
-	def get_frame(self):
-		global cap1
-		global df1
-		cap1 = WebcamVideoStream(src=0).start()
-		image = cap1.read()
-		image=cv2.resize(image,(600,500))
-		gray=cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
-		face_rects=face_cascade.detectMultiScale(gray,1.3,5)
-		df1 = pd.read_csv(music_dist[show_text[0]])
-		df1 = df1[['Name','Album','Artist']]
-		df1 = df1.head(15)
-		for (x,y,w,h) in face_rects:
-			cv2.rectangle(image,(x,y-50),(x+w,y+h+10),(0,255,0),2)
-			roi_gray_frame = gray[y:y + h, x:x + w]
-			cropped_img = np.expand_dims(np.expand_dims(cv2.resize(roi_gray_frame, (48, 48)), -1), 0)
-			prediction = emotion_model.predict(cropped_img)
+    if not path.is_file():
+        raise FileNotFoundError(f"Song file not found: {path}")
 
-			maxindex = int(np.argmax(prediction))
-			show_text[0] = maxindex 
-			#print("===========================================",music_dist[show_text[0]],"===========================================")
-			#print(df1)
-			cv2.putText(image, emotion_dict[maxindex], (x+20, y-60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-			df1 = music_rec()
-			
-		global last_frame1
-		last_frame1 = image.copy()
-		pic = cv2.cvtColor(last_frame1, cv2.COLOR_BGR2RGB)     
-		img = Image.fromarray(last_frame1)
-		img = np.array(img)
-		ret, jpeg = cv2.imencode('.jpg', img)
-		return jpeg.tobytes(), df1
+    songs = pd.read_csv(path)
+    missing_columns = set(SONG_COLUMNS) - set(songs.columns)
 
-def music_rec():
-	# print('---------------- Value ------------', music_dist[show_text[0]])
-	df = pd.read_csv(music_dist[show_text[0]])
-	df = df[['Name','Album','Artist']]
-	df = df.head(15)
-	return df
+    if missing_columns:
+        raise ValueError(
+            f"{path.name} is missing columns: "
+            f"{', '.join(sorted(missing_columns))}"
+        )
+
+    return songs.loc[:, SONG_COLUMNS].head(15).copy()
+
+
+def music_rec(emotion_index=None):
+    """Return songs for the selected or most recent expression."""
+    if emotion_index is None:
+        emotion_index = current_emotion
+
+    if emotion_index not in EMOTIONS:
+        raise ValueError(f"Unknown emotion index: {emotion_index}")
+
+    return load_songs(emotion_index).copy()
+
+
+class VideoCamera:
+    """Capture frames and return annotated images with song suggestions."""
+
+    def __init__(self, src=0):
+        self.capture = None
+        self.emotion_index = 4
+
+        cascade_path = (
+            Path(cv2.data.haarcascades)
+            / "haarcascade_frontalface_default.xml"
+        )
+        self.face_cascade = cv2.CascadeClassifier(str(cascade_path))
+
+        if self.face_cascade.empty():
+            raise RuntimeError("Could not load the face detector.")
+
+        # Check all song files before opening the camera.
+        for emotion_index in EMOTIONS:
+            load_songs(emotion_index)
+
+        self.capture = cv2.VideoCapture(src)
+
+        if not self.capture.isOpened():
+            self.close()
+            raise RuntimeError(
+                "Could not open the webcam. Check camera permissions "
+                "and close other apps using it."
+            )
+
+    def get_frame(self):
+        global current_emotion
+
+        if self.capture is None:
+            raise RuntimeError("The webcam connection is closed.")
+
+        success, frame = self.capture.read()
+
+        if not success or frame is None:
+            raise RuntimeError(
+                "Could not read a webcam frame. Check the camera "
+                "connection and restart the app."
+            )
+
+        # Preserve the camera image's aspect ratio.
+        height, width = frame.shape[:2]
+        display_width = 600
+        display_height = max(1, round(height * display_width / width))
+        frame = cv2.resize(frame, (display_width, display_height))
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        faces = self.face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.3,
+            minNeighbors=5,
+        )
+
+        if len(faces) > 0:
+            # Use the largest detected face for one consistent song list.
+            x, y, w, h = max(
+                faces,
+                key=lambda rectangle: rectangle[2] * rectangle[3],
+            )
+
+            face = gray[y:y + h, x:x + w]
+            face = cv2.resize(face, (48, 48))
+
+            # Match the rescale=1./255 preprocessing in train.py.
+            model_input = face.astype(np.float32) / 255.0
+            model_input = model_input.reshape(1, 48, 48, 1)
+
+            with prediction_lock:
+                predictions = emotion_model.predict(
+                    model_input,
+                    verbose=0,
+                )
+                self.emotion_index = int(np.argmax(predictions[0]))
+                current_emotion = self.emotion_index
+
+            cv2.rectangle(
+                frame,
+                (x, y),
+                (x + w, y + h),
+                (0, 255, 0),
+                2,
+            )
+
+            cv2.putText(
+                frame,
+                EMOTIONS[self.emotion_index],
+                (x, max(25, y - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+        else:
+            cv2.putText(
+                frame,
+                "No face detected",
+                (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+        # Keep the previous recommendations when no face is visible.
+        recommendations = music_rec(self.emotion_index)
+
+        success, jpeg = cv2.imencode(".jpg", frame)
+
+        if not success:
+            raise RuntimeError("Could not encode the webcam frame.")
+
+        return jpeg.tobytes(), recommendations
+
+    def close(self):
+        """Release the camera when streaming ends."""
+        if self.capture is not None:
+            self.capture.release()
+            self.capture = None
+
+    def __del__(self):
+        self.close()
