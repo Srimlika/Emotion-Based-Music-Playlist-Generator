@@ -13,11 +13,19 @@ def index():
     return render_template('index.html', headings=headings, data=df1)
 
 def gen(camera):
-    while True:
-        global df1
-        frame, df1 = camera.get_frame()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
+    global df1
+
+    try:
+        while True:
+            frame, df1 = camera.get_frame()
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n"
+                + frame
+                + b"\r\n"
+            )
+    finally:
+        camera.close()
 
 @app.route('/video_feed')
 def video_feed():
