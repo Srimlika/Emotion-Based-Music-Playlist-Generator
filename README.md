@@ -16,6 +16,12 @@ This project uses a webcam to classify facial expressions and recommend songs th
 
 The application combines a facial-expression model trained on FER2013 with a Flask interface and emotion-specific song lists. Spotify playlist utilities are used to refresh the recommendations.
 
+## App Preview
+
+![Application showing webcam-based expression classification alongside song recommendations](pic2.png)
+
+*The interface displays the predicted expression alongside the recommended tracks.*
+
 ## How It Works
 
 1. The webcam captures a live video feed.
